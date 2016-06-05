@@ -20,5 +20,4 @@ if __name__ == '__main__':
         lambda x: map(int, x[:2])
     )
 
-
-    user_mat, prod_mat = optimize_mf(ratings, 20, 3)
+    userMat, prodMat = optimizeMF(ratings, 20, 10)
