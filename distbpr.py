@@ -4,6 +4,7 @@ import numpy as np
 
 def _optimize_partition(user_ratings, prod_mat, nb_prods, l2_reg=0.001,
                         alpha=0.1, negative_samples=30, num_samples=20000):
+
     # yank everything out of the iterator
     user_ratings = [_ for _ in user_ratings]
 
@@ -48,21 +49,27 @@ def _optimize_partition(user_ratings, prod_mat, nb_prods, l2_reg=0.001,
     yield (prod_mat, user_vectors.items())
 
 
-def optimizeMF(ratings, rank=10, nb_iter=10, nb_partitions=4):
+def optimizeMF(ratings, rank=10, nb_iter=10, nb_partitions=4,
+               num_samples=100000, l2_reg=0.001, alpha=0.1,
+               negative_samples=30):
     """optimize BPR for Matrix Factorization
-    
+
     Args:
     -----
         ratings: RDD of (user, item) implicit interactions
         rank: latent factor dimension
         nb_iter: how many iterations of SGD
         nb_partitions: how many user partitions to distribute
-    
+        num_samples: |D_s| from the paper
+        negative_samples: how many negative samples per positive example
+        l2_reg: regularization parameter
+        alpha: learning rate
+
     Returns:
     --------
         (userMat, itemMat)
     """
-    
+
     nb_prods = ratings.map(lambda (_, i): i).max()
     ratings_by_user = ratings.groupByKey().persist()
 
@@ -75,17 +82,30 @@ def optimizeMF(ratings, rank=10, nb_iter=10, nb_partitions=4):
 
     for _ in xrange(nb_iter):
         result = ratings_partitioned.mapPartitions(
-            lambda ratings: _optimize_partition(ratings, prod_mat, nb_prods)
-        ).persist()
+            # sample and apply the gradient
+            lambda ratings: _optimize_partition(
+                user_ratings=ratings,
+                prod_mat=prod_mat,
+                nb_prods=nb_prods,
+                num_samples=num_samples,
+                l2_reg=l2_reg,
+                alpha=alpha,
+                negative_samples=negative_samples
+            )
+        ).persist()  # cache for later
 
         prod_mat = result.map(
+            # get the product matrices
             lambda x: x[0]
         ).reduce(
+            # reduce as matrix addition
             lambda x, y: x + y
         ) / result.count()
 
         user_vecs_rdd = result.map(lambda x: x[1]).flatMap(lambda x: x)
-        ratings_partitioned = ratings_by_user.join(user_vecs_rdd)  # .persist()
+        ratings_partitioned = ratings_by_user.join(user_vecs_rdd)
+
+        # release this
         result.unpersist()
 
     # Only for evaluation purposes
@@ -102,61 +122,3 @@ def optimizeMF(ratings, rank=10, nb_iter=10, nb_partitions=4):
         user_mat[u] = v
 
     return (user_mat, prod_mat)
-
-
-
-def optimizeValidateMF(ratings, rank=10, nb_iter=10, nb_partitions=4, num_samples=None):
-    """optimize BPR for Matrix Factorization
-    
-    Args:
-    -----
-        ratings: RDD of (user, item) implicit interactions
-        rank: latent factor dimension
-        nb_iter: how many iterations of SGD
-        nb_partitions: how many user partitions to distribute
-    
-    Returns:
-    --------
-        (userMat, itemMat)
-    """
-    
-    nb_prods = ratings.map(lambda (_, i): i).max()
-    nb_users = ratings.map(lambda x: x[0]).max()
-    ratings_by_user = ratings.groupByKey().persist()
-
-    def make_vec((u_id, products)):
-        return (u_id, (products, np.random.uniform(size=rank)))
-
-    user_ratings = ratings_by_user.map(make_vec).persist()
-    ratings_partitioned = user_ratings.partitionBy(nb_partitions).persist()
-    prod_mat = np.random.uniform(size=(nb_prods + 1, rank))
-    auc = []
-    for _ in xrange(nb_iter):
-        result = ratings_partitioned.mapPartitions(
-            lambda ratings: _optimize_partition(ratings, prod_mat, nb_prods, num_samples=num_samples)
-        ).persist()
-
-        prod_mat = result.map(
-            lambda x: x[0]
-        ).reduce(
-            lambda x, y: x + y
-        ) / result.count()
-
-        user_vecs_rdd = result.map(lambda x: x[1]).flatMap(lambda x: x)
-        ratings_partitioned = ratings_by_user.join(user_vecs_rdd)  # .persist()
-        result.unpersist()
-
-        user_mat = np.random.uniform(size=(nb_users + 1, rank))
-
-        user_vectors = map(
-            lambda (u_id, (products, vector)): (u_id, vector),
-            ratings_partitioned.toLocalIterator()
-        )
-
-        for u, v in user_vectors:
-            user_mat[u] = v
-
-        auc.append(test_auc(user_mat, prod_mat))
-
-
-    return (user_mat, prod_mat, auc)
