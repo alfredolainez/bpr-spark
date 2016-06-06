@@ -14,9 +14,7 @@ import breeze.linalg.{DenseMatrix, DenseVector}
 
 object MainBPR {
 
-  // TODO: ADD NUM PARTITIONS AS A PARAMETER
-  // TODO: CHANGE SONGS BY PRODUCTS
-  // TODO: CHANGE RESULT2 for RESULT
+  // TODO: ADD REGULARIZATION
 
   def main(args: Array[String]) {
 
@@ -29,28 +27,22 @@ object MainBPR {
         val x_uij = userMat(userId, ::).dot(prodMat(prodPos, ::)) - userMat(userId, ::).dot(prodMat(prodNeg, ::))
 
         val scale = math.exp(-x_uij) / (1 + math.exp(-x_uij))
-        userMat(userId, ::) :+= ((prodMat(prodPos, ::) - prodMat(prodNeg, ::)) :* scale) :* alpha // TODO: SHOULD BE AT THE END, we are overwriting the others parameters with it
-        prodMat(prodPos, ::) :+= (userMat(userId, ::) :* scale) :* alpha
-        prodMat(prodNeg, ::) :+= (-userMat(userId, ::) :* scale) :* alpha
-
-        // Add regularization
-        //userMat :+= userMat :* (lambdaReg * alpha)
-        //prodMat :+= prodMat :* (lambdaReg * alpha)
-
+        prodMat(prodPos, ::) :+= ((userMat(userId, ::) :* scale) + (prodMat(prodPos, ::) :* lambdaReg)) :* alpha
+        prodMat(prodNeg, ::) :+= ((-userMat(userId, ::) :* scale) + (prodMat(prodNeg, ::) :* lambdaReg)) :* alpha
+        userMat(userId, ::) :+= (((prodMat(prodPos, ::) - prodMat(prodNeg, ::)) :* scale) +
+          (userMat(userId, ::) :* lambdaReg)) :* alpha
       }
 
       private def sampleAndOptimizePartition(ratings: Iterator[(Int, Int)], userMat: DenseMatrix[Double],
-                                             prodMat: DenseMatrix[Double], numProds: Int, lambdaReg: Double = 0.1,
-                                             alpha: Double = 0.01): Iterator[Tuple2[DenseMatrix[Double], DenseMatrix[Double]]] = {
+                                             prodMat: DenseMatrix[Double], numProds: Int, numSamples: Int = 20000,
+                                             lambdaReg: Double = 0.1, alpha: Double = 0.01): Iterator[Tuple2[DenseMatrix[Double], DenseMatrix[Double]]] = {
 
-        val NUM_OF_NEGATIVE_PER_IMPLICIT = 30
+        val NUM_OF_NEGATIVE_PER_IMPLICIT = 5
 
         val positiveRatingsRepeated = ratings.flatMap(x => Vector.fill(NUM_OF_NEGATIVE_PER_IMPLICIT)(x)).toVector
         val negativeRatings = positiveRatingsRepeated.map(x => (x._1, x._2, Random.nextInt(numProds) + 1))
 
-        //val allRatings = new Vector[(Int, Int, Int)](negativeRatings) // TODO: REMOVE THE NEGATIVE STUFF THAT IS NOT ACTUALLY NEGATIVE SAMPLING?
-        val allRatings = negativeRatings
-        val sampledRatings = Random.shuffle(allRatings.toList).toVector.slice(0, 20000) // TODO: ADD PROPER CONSTANTS
+        val sampledRatings = Random.shuffle(negativeRatings.toList).toVector.slice(0, numSamples)
 
         for (sampledPoint <- sampledRatings) {
           gradientSinglePoint(sampledPoint._1, sampledPoint._2, sampledPoint._3, userMat, prodMat)
@@ -60,29 +52,29 @@ object MainBPR {
       }
 
       def optimizeMF(ratings: RDD[(Int, Int)], rank: Int = 10,
-                     numIterations: Int = 10): (DenseMatrix[Double], DenseMatrix[Double]) = {
+                     numIterations: Int = 10, numPartitions: Int = 4): (DenseMatrix[Double], DenseMatrix[Double]) = {
 
         // Partition by user
         val userPartitioner = new RangePartitioner(4, ratings)
         val ratingsPartitioned = ratings.partitionBy(userPartitioner).persist()
 
         val numUsers = ratingsPartitioned.map(x => x._1).max()
-        val numSongs = ratingsPartitioned.map(x => x._2).max()
+        val numProds = ratingsPartitioned.map(x => x._2).max()
 
         var userMat: DenseMatrix[Double] = DenseMatrix.rand[Double](numUsers + 1, rank)
-        var prodMat: DenseMatrix[Double] = DenseMatrix.rand[Double](numSongs + 1, rank)
+        var prodMat: DenseMatrix[Double] = DenseMatrix.rand[Double](numProds + 1, rank)
 
         for (i <- 1 until numIterations) {
           val result = ratingsPartitioned.mapPartitions {
-            ratings => sampleAndOptimizePartition(ratings, userMat, prodMat, numSongs)
+            ratings => sampleAndOptimizePartition(ratings, userMat, prodMat, numProds)
           }
 
           // Average through parameters
-          val num = result.count.toDouble
-          val result2 = result.reduce((a, b) => (a._1 + b._1, a._2 + b._2))
+          val numReducers = result.count.toDouble
+          val averagedMatrices = result.reduce((a, b) => (a._1 + b._1, a._2 + b._2))
 
-          userMat = result2._1 :/ num
-          prodMat = result2._2 :/ num
+          userMat = averagedMatrices._1 :/ numReducers
+          prodMat = averagedMatrices._2 :/ numReducers
         }
 
         return (userMat, prodMat)
@@ -148,7 +140,7 @@ object MainBPR {
 
           var scale = math.exp(-x_uij) / (1 + math.exp(-x_uij))
           prodMat(prodPos, ::) :+= (userVector :* scale).t :* alpha
-          prodMat(prodNeg, ::) :+= (userVector :* scale).t :* alpha
+          prodMat(prodNeg, ::) :+= (-userVector :* scale).t :* alpha
 
           val newUserVector = userVector + ((prodMat(prodPos, ::) - prodMat(prodNeg, ::)) :* scale).t :* alpha
           userVectors(userId) = newUserVector
@@ -160,7 +152,7 @@ object MainBPR {
       def optimizeMF(ratings: RDD[(Int, Int)], rank: Int = 10,
                      numIterations: Int = 10, numPartitions: Int = 4): (DenseMatrix[Double], DenseMatrix[Double]) = {
 
-        val numSongs = ratings.map(x => x._2).max()
+        val numProds = ratings.map(x => x._2).max()
 
         // Partition by user: also create the distributed vector
         val ratingsByUser = ratings.groupByKey().persist()
@@ -174,17 +166,17 @@ object MainBPR {
 
         //val numUsers = ratingsPartitioned.map(x => x._1).max()
 
-        var prodMat: DenseMatrix[Double] = DenseMatrix.rand[Double](numSongs + 1, rank)
+        var prodMat: DenseMatrix[Double] = DenseMatrix.rand[Double](numProds + 1, rank)
 
         for (i <- 1 until numIterations) {
           val result = ratingsPartitioned.mapPartitions {
-            ratings => sampleAndOptimizePartition(ratings, prodMat, numSongs)
+            ratings => sampleAndOptimizePartition(ratings, prodMat, numProds)
           }
 
           prodMat = result.map(x => x._1).reduce((a, b) => a + b) :/ result.count.toDouble
 
           val userVectorsRDD = result.map(x => x._2).flatMap(x => x.map(y => y))
-          ratingsPartitioned = ratingsByUser.join(userVectorsRDD)
+          ratingsPartitioned = ratingsByUser.join(userVectorsRDD).cache()
 
           //ratingsPartitioned = resul
 
@@ -213,8 +205,8 @@ object MainBPR {
     val sc = new SparkContext(conf)
 
     val ratingsBPR = sc.textFile("/home/alfredo/Desktop/bpr/training_ratings.txt").map(line => line.split(" ")).map(x => (x(0).toInt, x(1).toInt))
-    //val (userMat, prodMat) = BPR.optimizeMF(ratingsBPR, 10, 10)
-    val (userMat, prodMat) = DistributedUserBPR.optimizeMF(ratingsBPR, 10, 20)
+    val (userMat, prodMat) = BPR.optimizeMF(ratingsBPR, 10, 10)
+    //val (userMat, prodMat) = DistributedUserBPR.optimizeMF(ratingsBPR, 10, 10)
 
     breeze.linalg.csvwrite(new File("/home/alfredo/Desktop/bpr/userMatrix.txt"), userMat, separator = ' ')
     breeze.linalg.csvwrite(new File("/home/alfredo/Desktop/bpr/prodMatrix.txt"), prodMat, separator = ' ')

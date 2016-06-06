@@ -1,5 +1,5 @@
 from pyspark import SparkConf, SparkContext
-from bpr import optimize_mf
+from bpr import optimizeMF
 
 conf = (SparkConf().setMaster("local")
                    .setAppName("BPR")
@@ -20,4 +20,4 @@ if __name__ == '__main__':
         lambda x: map(int, x[:2])
     )
 
-    userMat, prodMat = optimizeMF(ratings, 20, 10)
+    userMat, prodMat = optimizeMF(ratings, 10, 10)
